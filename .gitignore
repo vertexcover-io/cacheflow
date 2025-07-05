@@ -10,3 +10,5 @@ wheels/
 .venv
 .cache
 .claude
+.vscode
+CLAUDE.md
