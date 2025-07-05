@@ -1,6 +1,7 @@
 """LLM-specific caching utilities."""
 
 import hashlib
+import json
 import re
 from collections.abc import Callable
 
@@ -51,56 +52,76 @@ def get_provider_key_fn(provider: str) -> Callable:
     return provider_map.get(provider, default_llm_key_fn)
 
 
-def openai_key_fn(fn_name: str, args: tuple, kwargs: dict) -> str:
-    """OpenAI-specific key generation with image handling."""
-    # Process messages for image content
-    if "messages" in kwargs:
-        kwargs = dict(kwargs)  # Make a copy
-        kwargs["messages"] = _normalize_openai_messages(kwargs["messages"])
+def extract_image_keys(kwargs: dict) -> list:
+    """Extract image keys from metadata."""
+    metadata = kwargs.get("metadata", {})
+    return metadata.get("image_keys", [])
+
+
+def _generic_llm_key_fn(args: tuple, kwargs: dict, message_processor: Callable) -> str:
+    """Generic LLM key generation with image handling."""
+    # Extract image keys from metadata
+    image_keys = extract_image_keys(kwargs)
+
+    # Make a copy of kwargs to avoid modifying the original
+    kwargs = dict(kwargs)
+
+    # Process messages/content for image normalization
+    kwargs = message_processor(kwargs, image_keys)
 
     # Remove metadata if present (not part of API call)
     kwargs = {k: v for k, v in kwargs.items() if k != "metadata"}
 
-    return f"{fn_name}({cache_json_serializer(args)},{cache_json_serializer(kwargs)})"
+    json_key = {"args": args, "kwargs": kwargs}
+    json_str = json.dumps(json_key, default=cache_json_serializer)
+    return hashlib.md5(json_str.encode()).hexdigest()
 
 
-def anthropic_key_fn(fn_name: str, args: tuple, kwargs: dict) -> str:
-    """Anthropic-specific key generation."""
-    # Process messages for image content
+def _process_openai_messages(kwargs: dict, image_keys: list) -> dict:
+    """Process OpenAI messages for image normalization."""
     if "messages" in kwargs:
-        kwargs = dict(kwargs)  # Make a copy
-        kwargs["messages"] = _normalize_anthropic_messages(kwargs["messages"])
-
-    # Remove metadata if present
-    kwargs = {k: v for k, v in kwargs.items() if k != "metadata"}
-
-    return f"{fn_name}({cache_json_serializer(args)},{cache_json_serializer(kwargs)})"
+        kwargs["messages"] = _normalize_openai_messages(kwargs["messages"], image_keys)
+    return kwargs
 
 
-def gemini_key_fn(fn_name: str, args: tuple, kwargs: dict) -> str:
-    """Gemini-specific key generation."""
-    # Process messages for image content
+def _process_anthropic_messages(kwargs: dict, image_keys: list) -> dict:
+    """Process Anthropic messages for image normalization."""
+    if "messages" in kwargs:
+        kwargs["messages"] = _normalize_anthropic_messages(kwargs["messages"], image_keys)
+    return kwargs
+
+
+def _process_gemini_contents(kwargs: dict, image_keys: list) -> dict:
+    """Process Gemini contents for image normalization."""
     if "contents" in kwargs:
-        kwargs = dict(kwargs)  # Make a copy
-        kwargs["contents"] = _normalize_gemini_contents(kwargs["contents"])
-
-    # Remove metadata if present
-    kwargs = {k: v for k, v in kwargs.items() if k != "metadata"}
-
-    return f"{fn_name}({cache_json_serializer(args)},{cache_json_serializer(kwargs)})"
+        kwargs["contents"] = _normalize_gemini_contents(kwargs["contents"], image_keys)
+    return kwargs
 
 
-def default_llm_key_fn(fn_name: str, args: tuple, kwargs: dict) -> str:
+def openai_key_fn(args: tuple, kwargs: dict) -> str:
+    """OpenAI-specific key generation with image handling."""
+    return _generic_llm_key_fn(args, kwargs, _process_openai_messages)
+
+
+def anthropic_key_fn(args: tuple, kwargs: dict) -> str:
+    """Anthropic-specific key generation."""
+    return _generic_llm_key_fn(args, kwargs, _process_anthropic_messages)
+
+
+def gemini_key_fn(args: tuple, kwargs: dict) -> str:
+    """Gemini-specific key generation."""
+    return _generic_llm_key_fn(args, kwargs, _process_gemini_contents)
+
+
+def default_llm_key_fn(args: tuple, kwargs: dict) -> str:
     """Default LLM key generation without provider-specific handling."""
-    # Remove metadata if present
-    kwargs = {k: v for k, v in kwargs.items() if k != "metadata"}
-
-    return f"{fn_name}({cache_json_serializer(args)},{cache_json_serializer(kwargs)})"
+    return _generic_llm_key_fn(args, kwargs, lambda k, _: k)
 
 
-def _normalize_openai_messages(messages: list[dict]) -> list[dict]:
+def _normalize_openai_messages(messages: list[dict], image_keys: list) -> list[dict]:
     """Normalize OpenAI messages by replacing image URLs with placeholders."""
     normalized = []
+    image_index = 0
 
     for message in messages:
         if isinstance(message, dict) and "content" in message:
@@ -114,12 +135,17 @@ def _normalize_openai_messages(messages: list[dict]) -> list[dict]:
                 normalized_content = []
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "image_url":
-                        # Replace image URL with placeholder
+                        url = item["image_url"]["url"]
+                        # Replace with image key if available, otherwise use placeholder
+                        if image_index < len(image_keys):
+                            replacement_url = f"image_key:{image_keys[image_index]}"
+                        else:
+                            replacement_url = _get_image_placeholder(url)
+
+                        image_index += 1
                         normalized_item = {
                             "type": "image_url",
-                            "image_url": {
-                                "url": _get_image_placeholder(item["image_url"]["url"])
-                            },
+                            "image_url": {"url": replacement_url},
                         }
                         normalized_content.append(normalized_item)
                     else:
@@ -136,9 +162,10 @@ def _normalize_openai_messages(messages: list[dict]) -> list[dict]:
     return normalized
 
 
-def _normalize_anthropic_messages(messages: list[dict]) -> list[dict]:
+def _normalize_anthropic_messages(messages: list[dict], image_keys: list) -> list[dict]:
     """Normalize Anthropic messages by replacing image content with placeholders."""
     normalized = []
+    image_index = 0
 
     for message in messages:
         if isinstance(message, dict) and "content" in message:
@@ -152,13 +179,20 @@ def _normalize_anthropic_messages(messages: list[dict]) -> list[dict]:
                 normalized_content = []
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "image":
-                        # Replace image data with placeholder
+                        image_data = item["source"]["data"]
+                        # Replace with image key if available, otherwise use placeholder
+                        if image_index < len(image_keys):
+                            replacement_data = f"image_key:{image_keys[image_index]}"
+                        else:
+                            replacement_data = _get_image_placeholder(image_data)
+
+                        image_index += 1
                         normalized_item = {
                             "type": "image",
                             "source": {
                                 "type": "base64",
                                 "media_type": item["source"]["media_type"],
-                                "data": _get_image_placeholder(item["source"]["data"]),
+                                "data": replacement_data,
                             },
                         }
                         normalized_content.append(normalized_item)
@@ -176,9 +210,10 @@ def _normalize_anthropic_messages(messages: list[dict]) -> list[dict]:
     return normalized
 
 
-def _normalize_gemini_contents(contents: list[dict]) -> list[dict]:
+def _normalize_gemini_contents(contents: list[dict], image_keys: list) -> list[dict]:
     """Normalize Gemini contents by replacing image data with placeholders."""
     normalized = []
+    image_index = 0
 
     for content in contents:
         if isinstance(content, dict) and "parts" in content:
@@ -187,11 +222,18 @@ def _normalize_gemini_contents(contents: list[dict]) -> list[dict]:
 
             for part in parts:
                 if isinstance(part, dict) and "inline_data" in part:
-                    # Replace image data with placeholder
+                    image_data = part["inline_data"]["data"]
+                    # Replace with image key if available, otherwise use placeholder
+                    if image_index < len(image_keys):
+                        replacement_data = f"image_key:{image_keys[image_index]}"
+                    else:
+                        replacement_data = _get_image_placeholder(image_data)
+
+                    image_index += 1
                     normalized_part = {
                         "inline_data": {
                             "mime_type": part["inline_data"]["mime_type"],
-                            "data": _get_image_placeholder(part["inline_data"]["data"]),
+                            "data": replacement_data,
                         }
                     }
                     normalized_parts.append(normalized_part)
@@ -237,7 +279,7 @@ def _get_image_placeholder(image_data: str) -> str:
 
 
 def replace_image_urls_with_keys(
-    messages: list[dict], image_keys: dict[str, str]
+    messages: list[dict], image_keys: list[str]
 ) -> list[dict]:
     """
     Replace image URLs in messages with keys from metadata.
@@ -249,6 +291,7 @@ def replace_image_urls_with_keys(
         return messages
 
     normalized = []
+    image_index = 0
 
     for message in messages:
         if isinstance(message, dict) and "content" in message:
@@ -258,13 +301,15 @@ def replace_image_urls_with_keys(
                 normalized_content = []
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "image_url":
-                        url = item["image_url"]["url"]
                         # Replace with key if available
-                        if url in image_keys:
+                        if image_index < len(image_keys):
                             normalized_item = {
                                 "type": "image_url",
-                                "image_url": {"url": f"image_key:{image_keys[url]}"},
+                                "image_url": {
+                                    "url": f"image_key:{image_keys[image_index]}"
+                                },
                             }
+                            image_index += 1
                             normalized_content.append(normalized_item)
                         else:
                             normalized_content.append(item)

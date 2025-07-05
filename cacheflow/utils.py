@@ -2,12 +2,11 @@
 
 import asyncio
 import functools
-import hashlib
 import inspect
 from collections.abc import Callable
 from typing import Any
 
-from .serializers import serialize_function_args
+from .serializers import default_key_fn
 
 
 def is_async_function(func: Callable) -> bool:
@@ -16,39 +15,30 @@ def is_async_function(func: Callable) -> bool:
 
 
 def generate_cache_key(
-    func_name: str, args: tuple, kwargs: dict, namespace: str | None = None
+    func_name: str,
+    args: tuple,
+    kwargs: dict,
+    namespace: str | None = None,
+    key_fn: Callable | None = None,
 ) -> str:
     """Generate a cache key from function name and arguments."""
-    key = serialize_function_args(func_name, args, kwargs)
+    # Generate hash from function arguments
+    hash_part = key_fn(args, kwargs) if key_fn else default_key_fn(args, kwargs)
 
+    # Format as namespace:name:hash
     if namespace:
-        key = f"{namespace}:{key}"
+        key = f"{namespace}:{func_name}:{hash_part}"
+    else:
+        key = f"{func_name}:{hash_part}"
 
     return key
 
 
-def md5_hash(text: str) -> str:
-    """Generate MD5 hash of text."""
-    return hashlib.md5(text.encode()).hexdigest()
-
-
-def extract_cache_control_from_kwargs(kwargs: dict) -> tuple[dict, dict]:
+def extract_cache_control_from_kwargs(kwargs: dict) -> tuple[bool, dict]:
     """Extract cache control parameters from kwargs."""
-    cache_control = {}
-    filtered_kwargs = {}
-
-    # Cache control parameters
-    cache_control_keys = {"no_cache", "ttl", "namespace", "cache_key", "cache_name"}
-
-    for key, value in kwargs.items():
-        if key in cache_control_keys:
-            cache_control[key] = value
-        elif key == "cache_control" and isinstance(value, dict):
-            cache_control.update(value)
-        else:
-            filtered_kwargs[key] = value
-
-    return cache_control, filtered_kwargs
+    filtered_kwargs = {**kwargs}
+    skip = filtered_kwargs.pop("_cacheflow_skip", False)
+    return skip, filtered_kwargs
 
 
 def safe_call_async(func: Callable, *args, **kwargs) -> Any:

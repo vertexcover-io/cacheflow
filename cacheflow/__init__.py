@@ -15,8 +15,6 @@ from .core import (
     clear_all_cache,
     clear_namespace,
     delete_cache_key,
-    get_cache_key,
-    warm_cache,
 )
 
 # LLM-specific caching
@@ -46,7 +44,6 @@ __all__ = [
     "configure",
     "delete_cache_key",
     "generate_cache_key",
-    "get_cache_key",
     "get_config",
     "is_async_function",
     # LLM
@@ -54,5 +51,4 @@ __all__ = [
     "normalize_cache_key",
     "replace_image_urls_with_keys",
     "reset_config",
-    "warm_cache",
 ]

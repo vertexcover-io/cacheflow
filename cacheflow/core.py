@@ -5,7 +5,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from .config import create_backend, get_config
+from .config import get_config
 from .utils import (
     extract_cache_control_from_kwargs,
     generate_cache_key,
@@ -23,7 +23,6 @@ def cache(
     name: str | None = None,
     name_fn: Callable | None = None,
     key_fn: Callable | None = None,
-    backend: str | None = None,
     enabled: bool | None = None,
 ):
     """
@@ -50,13 +49,7 @@ def cache(
             return f
 
         # Get the appropriate backend
-        cache_backend = create_backend(backend) if backend else config.get_backend()
-
-        # Generate function name for cache key
-        func_name = name or f.__name__
-        if name_fn:
-            # name_fn will be called with args and kwargs at runtime
-            func_name = None
+        cache_backend = config.get_backend()
 
         # Determine namespace
         cache_namespace = namespace or config.namespace
@@ -69,16 +62,16 @@ def cache(
             @functools.wraps(f)
             async def async_wrapper(*args, **kwargs):
                 return await _cache_function_call_async(
-                    f,
-                    args,
-                    kwargs,
-                    cache_backend,
-                    func_name,
-                    name_fn,
-                    cache_namespace,
-                    cache_ttl,
-                    key_fn,
-                    config.debug,
+                    func=f,
+                    args=args,
+                    kwargs=kwargs,
+                    cache_backend=cache_backend,
+                    name=name,
+                    name_fn=name_fn,
+                    namespace=cache_namespace,
+                    ttl=cache_ttl,
+                    key_fn=key_fn,
+                    debug=config.debug,
                 )
 
             return async_wrapper
@@ -87,16 +80,16 @@ def cache(
             @functools.wraps(f)
             def sync_wrapper(*args, **kwargs):
                 return _cache_function_call(
-                    f,
-                    args,
-                    kwargs,
-                    cache_backend,
-                    func_name,
-                    name_fn,
-                    cache_namespace,
-                    cache_ttl,
-                    key_fn,
-                    config.debug,
+                    func=f,
+                    args=args,
+                    kwargs=kwargs,
+                    cache_backend=cache_backend,
+                    name=name,
+                    name_fn=name_fn,
+                    namespace=cache_namespace,
+                    ttl=cache_ttl,
+                    key_fn=key_fn,
+                    debug=config.debug,
                 )
 
             return sync_wrapper
@@ -113,7 +106,7 @@ def _cache_function_call(
     args: tuple,
     kwargs: dict,
     cache_backend: Any,
-    func_name: str | None,
+    name: str | None,
     name_fn: Callable | None,
     namespace: str | None,
     ttl: int | None,
@@ -121,36 +114,25 @@ def _cache_function_call(
     debug: bool,
 ) -> Any:
     """Handle the actual caching logic for function calls."""
+
     # Extract cache control parameters
-    cache_control, filtered_kwargs = extract_cache_control_from_kwargs(kwargs)
+    skip_cache, filtered_kwargs = extract_cache_control_from_kwargs(kwargs)
 
     # Check for no_cache override
-    if cache_control.get("no_cache", False):
+    if skip_cache:
         if debug:
             logger.info(f"Cache disabled for {func.__name__}")
         return func(*args, **filtered_kwargs)
 
-    # Override parameters from cache_control
-    actual_ttl = cache_control.get("ttl", ttl)
-    actual_namespace = cache_control.get("namespace", namespace)
-    actual_name = cache_control.get("cache_name", func_name)
+    if name_fn:
+        actual_name = name_fn(args, filtered_kwargs)
+    elif name is None:
+        actual_name = func.__name__
+    else:
+        actual_name = name
 
     # Generate cache key
-    if key_fn:
-        cache_key = key_fn(func.__name__, args, filtered_kwargs)
-    else:
-        if name_fn:
-            actual_name = name_fn(args, filtered_kwargs)
-        elif actual_name is None:
-            actual_name = func.__name__
-
-        cache_key = generate_cache_key(
-            actual_name, args, filtered_kwargs, actual_namespace
-        )
-
-    # Check if custom cache key provided
-    if "cache_key" in cache_control:
-        cache_key = cache_control["cache_key"]
+    cache_key = generate_cache_key(actual_name, args, filtered_kwargs, namespace, key_fn)
 
     # Try to get from cache
     cached_result = cache_backend.get(cache_key)
@@ -166,7 +148,7 @@ def _cache_function_call(
     result = func(*args, **filtered_kwargs)
 
     # Store in cache
-    cache_backend.set(cache_key, result, actual_ttl)
+    cache_backend.set(cache_key, result, ttl)
 
     if debug:
         logger.info(f"Cached result for {func.__name__}: {cache_key}")
@@ -179,7 +161,7 @@ async def _cache_function_call_async(
     args: tuple,
     kwargs: dict,
     cache_backend: Any,
-    func_name: str | None,
+    name: str | None,
     name_fn: Callable | None,
     namespace: str | None,
     ttl: int | None,
@@ -188,35 +170,23 @@ async def _cache_function_call_async(
 ) -> Any:
     """Handle the actual caching logic for async function calls."""
     # Extract cache control parameters
-    cache_control, filtered_kwargs = extract_cache_control_from_kwargs(kwargs)
+    skip_cache, filtered_kwargs = extract_cache_control_from_kwargs(kwargs)
 
     # Check for no_cache override
-    if cache_control.get("no_cache", False):
+    if skip_cache:
         if debug:
             logger.info(f"Cache disabled for {func.__name__}")
         return await func(*args, **filtered_kwargs)
 
-    # Override parameters from cache_control
-    actual_ttl = cache_control.get("ttl", ttl)
-    actual_namespace = cache_control.get("namespace", namespace)
-    actual_name = cache_control.get("cache_name", func_name)
+    if name_fn:
+        actual_name = name_fn(args, filtered_kwargs)
+    elif name is None:
+        actual_name = func.__name__
+    else:
+        actual_name = name
 
     # Generate cache key
-    if key_fn:
-        cache_key = key_fn(func.__name__, args, filtered_kwargs)
-    else:
-        if name_fn:
-            actual_name = name_fn(args, filtered_kwargs)
-        elif actual_name is None:
-            actual_name = func.__name__
-
-        cache_key = generate_cache_key(
-            actual_name, args, filtered_kwargs, actual_namespace
-        )
-
-    # Check if custom cache key provided
-    if "cache_key" in cache_control:
-        cache_key = cache_control["cache_key"]
+    cache_key = generate_cache_key(actual_name, args, filtered_kwargs, namespace, key_fn)
 
     # Try to get from cache
     cached_result = cache_backend.get(cache_key)
@@ -232,7 +202,7 @@ async def _cache_function_call_async(
     result = await func(*args, **filtered_kwargs)
 
     # Store in cache
-    cache_backend.set(cache_key, result, actual_ttl)
+    cache_backend.set(cache_key, result, ttl)
 
     if debug:
         logger.info(f"Cached result for {func.__name__}: {cache_key}")
@@ -278,39 +248,9 @@ def cache_exists(key: str, namespace: str | None = None) -> bool:
     return cache_backend.exists(key)
 
 
-def get_cache_key(
-    func: Callable, args: tuple, kwargs: dict, namespace: str | None = None
-) -> str:
-    """Get cache key for debugging purposes."""
-    # Extract cache control parameters
-    cache_control, filtered_kwargs = extract_cache_control_from_kwargs(kwargs)
-
-    # Use provided namespace or default
-    actual_namespace = cache_control.get("namespace", namespace)
-
-    return generate_cache_key(func.__name__, args, filtered_kwargs, actual_namespace)
-
-
 def clear_all_cache() -> None:
     """Clear all cache entries."""
     config = get_config()
     cache_backend = config.get_backend()
 
     cache_backend.clear()
-
-
-def warm_cache(func: Callable, param_sets: list[tuple]) -> None:
-    """Pre-populate cache with known values."""
-    if not is_async_function(func):
-        for params in param_sets:
-            if isinstance(params, tuple):
-                args, kwargs = params if len(params) == 2 else (params, {})
-            else:
-                args, kwargs = (params,), {}
-
-            try:
-                func(*args, **kwargs)
-            except Exception as e:
-                logger.warning(f"Failed to warm cache for {func.__name__}: {e}")
-    else:
-        logger.warning("Async function cache warming not supported in sync context")
